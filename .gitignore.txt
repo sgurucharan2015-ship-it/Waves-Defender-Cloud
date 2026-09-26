@@ -1,0 +1,8 @@
+server/.env
+server/data/
+server/__pycache__/
+client/build/
+*.db
+*.db-wal
+*.db-shm
+.venv/
