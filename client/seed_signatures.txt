@@ -1,0 +1,3 @@
+# sha256,label
+# Exact malicious PowerShell loader encountered in this conversation:
+61904b45e50738fe7780f40e960b230dfe464893e83e0ef624ef92d9481d8eeb,ClickFix.PowerShell.Loader.AstroFlow
