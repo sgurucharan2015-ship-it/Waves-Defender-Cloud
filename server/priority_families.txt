@@ -1,0 +1,37 @@
+# High-impact / well-known malware families.
+# Waves Defence queries MalwareBazaar by signature first, then by tag.
+# Keep this list reasonably small: default fetch is max 100 hashes per family.
+
+# Ransomware / extortion families
+LockBit
+Akira
+Clop
+BlackCat
+BlackBasta
+RansomHub
+Qilin
+Play
+Rhysida
+Medusa
+REvil
+Conti
+Ryuk
+WannaCry
+
+# Stealers, loaders, RATs, banking/botnet malware
+LummaStealer
+RedLineStealer
+AgentTesla
+Formbook
+Remcos
+AsyncRAT
+XWorm
+DarkGate
+SmokeLoader
+Emotet
+QakBot
+TrickBot
+IcedID
+Dridex
+Vidar
+Rhadamanthys
