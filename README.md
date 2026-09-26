@@ -1,8 +1,8 @@
-AegisAV
+# AegisAV
 AegisAV is a Windows user-mode antivirus / endpoint protection project written in C++20, with a Python FastAPI reputation/signature server.
 It is deliberately designed to be useful without doing dangerous things such as executing malware samples. Files are hashed and statically inspected; cloud lookups use hashes, and optional file upload sends raw bytes only to your own AegisAV server for static scanning.
-What is included
-Windows C++ endpoint
+# What is included
+# Windows C++ endpoint
 SHA-256 file hashing using Windows CNG / BCrypt.
 Local rolling signature database.
 Static heuristic analysis for scripts and PE files.
