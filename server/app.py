@@ -192,7 +192,7 @@ async def scan_file(
                 "label": clam.get("signature"),
             }
 
-        verdict = "suspicious" if local["score"] >= 35 else "unknown"
+        verdict = "malicious" if local["score"] >= 80 else ("suspicious" if local["score"] >= 35 else "unknown")
         return {**local, "verdict": verdict, "source": "static-analysis"}
 
 

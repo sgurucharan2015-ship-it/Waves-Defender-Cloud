@@ -31,6 +31,8 @@ def entropy(data: bytes) -> float:
     return -sum((c/n) * math.log2(c/n) for c in counts if c)
 
 def scan_bytes(data: bytes, filename: str = "upload.bin") -> dict:
+    # EICAR is a harmless industry-standard antivirus test pattern.
+    eicar = br"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
     sha256 = hashlib.sha256(data).hexdigest()
     low = data[:32*1024*1024].lower()
     score = 0
@@ -39,6 +41,8 @@ def scan_bytes(data: bytes, filename: str = "upload.bin") -> dict:
         nonlocal score
         score += points
         findings.append({"name": name, "score": points, "detail": detail})
+    if eicar in data:
+        add(100, "EICAR test file", "Standard EICAR antivirus test pattern")
     ext = Path(filename).suffix.lower()
     script = ext in {".ps1", ".bat", ".cmd", ".vbs", ".js", ".jse", ".wsf", ".hta"}
     if script: add(5, "Script file", ext)
