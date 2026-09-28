@@ -86,7 +86,7 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="Waves Defence Cloud", version="3.2-stateless-auth", lifespan=lifespan)
+app = FastAPI(title="Waves Defence Cloud", version="3.3-advanced-static", lifespan=lifespan)
 
 cors_origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "").split(",") if x.strip()]
 if cors_origins:
@@ -95,7 +95,7 @@ if cors_origins:
         allow_origins=cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-Aegis-Token", "X-File-Name"],
+        allow_headers=["Content-Type", "X-Aegis-Token", "X-File-Name", "X-Waves-Skip-Reputation"],
     )
 
 
@@ -104,7 +104,7 @@ async def root():
     return {
         "service": "Waves Defence Cloud",
         "ok": True,
-        "version": "3.2-stateless-auth",
+        "version": "3.3-advanced-static",
         "health": "/health",
         "docs": "/docs",
         "auth_backend": "stateless-hmac-sha256",
@@ -345,11 +345,21 @@ async def scan_file(
                     "label": clam.get("signature"),
                 }
 
-            verdict = "suspicious" if local["score"] >= 35 else "unknown"
+            # The advanced static analyzer can now produce a high-confidence
+            # malicious verdict only when multiple independent behavior
+            # categories corroborate one another. A high score alone is not
+            # enough.
+            verdict = local.get("static_verdict") or (
+                "suspicious" if local["score"] >= 35 else "unknown"
+            )
             return {
                 **local,
                 "verdict": verdict,
-                "source": "static-analysis",
+                "source": (
+                    "static-analysis-high-confidence"
+                    if verdict == "malicious"
+                    else "static-analysis"
+                ),
             }
 
         finally:
