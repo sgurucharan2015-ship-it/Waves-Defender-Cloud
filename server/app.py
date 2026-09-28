@@ -222,10 +222,19 @@ async def scan_file(
     request: Request,
     x_file_name: str | None = Header(default="upload.bin"),
     x_aegis_token: str | None = Header(default=None),
+    x_waves_skip_reputation: str | None = Header(default=None),
 ):
     require_api_or_master(x_aegis_token)
 
     filename = x_file_name or "upload.bin"
+
+    # X-Waves-Skip-Reputation: 1
+    # Bypasses BOTH the local hash-reputation database and live MalwareBazaar
+    # lookup for this request. Static analysis and optional ClamAV still run.
+    skip_reputation = (
+        (x_waves_skip_reputation or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
 
     # Reject known-oversize uploads before reading the body.
     cl = request.headers.get("content-length")
@@ -289,30 +298,37 @@ async def scan_file(
                 flush=True,
             )
 
-            row = db.get_hash(sha256)
-            if row:
-                return {
-                    **local,
-                    "verdict": "malicious",
-                    "source": row["source"],
-                    "label": row["label"],
-                }
-
-            live = await mb.lookup_hash(sha256)
-            if live:
-                db.upsert_hash(
-                    live["sha256"],
-                    live["label"],
-                    live["source"],
-                    live.get("first_seen"),
-                    live.get("last_seen"),
+            if skip_reputation:
+                print(
+                    "[SCAN] reputation skipped by X-Waves-Skip-Reputation",
+                    flush=True,
                 )
-                return {
-                    **local,
-                    "verdict": "malicious",
-                    "source": live["source"],
-                    "label": live["label"],
-                }
+            else:
+                row = db.get_hash(sha256)
+                if row:
+                    return {
+                        **local,
+                        "verdict": "malicious",
+                        "source": row["source"],
+                        "label": row["label"],
+                    }
+
+                print("[SCAN] MalwareBazaar lookup starting", flush=True)
+                live = await mb.lookup_hash(sha256)
+                if live:
+                    db.upsert_hash(
+                        live["sha256"],
+                        live["label"],
+                        live["source"],
+                        live.get("first_seen"),
+                        live.get("last_seen"),
+                    )
+                    return {
+                        **local,
+                        "verdict": "malicious",
+                        "source": live["source"],
+                        "label": live["label"],
+                    }
 
             # If ClamAV exists, scan the existing temp file directly instead of
             # constructing another full-size in-memory copy.
