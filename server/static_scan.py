@@ -16,6 +16,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import BinaryIO, Iterable
 
+from advanced_layers import analyze_file
+
 
 # ---------------------------------------------------------------------------
 # Resource limits: the public Render service is intentionally bounded.
@@ -188,7 +190,18 @@ IMPORT_CATEGORIES: dict[str, tuple[int, set[str]]] = {
     }),
     "crypto": (2, {
         "cryptencrypt", "cryptdecrypt", "bcryptencrypt", "bcryptdecrypt",
-        "cryptacquirecontexta", "cryptacquirecontextw",
+        "cryptacquirecontexta", "cryptacquirecontextw", "bcryptgeneratekeypair",
+        "bcryptgeneratesymmetrickey", "bcryptderivekey", "cryptgenkey",
+    }),
+    "filesystem": (2, {
+        "findfirstfilea", "findfirstfilew", "findnextfilea", "findnextfilew",
+        "createfilea", "createfilew", "readfile", "writefile", "deletefilea",
+        "deletefilew", "movefilea", "movefilew", "movefileexa", "movefileexw",
+        "setfileinformationbyhandle",
+    }),
+    "resolver": (4, {
+        "getprocaddress", "loadlibrarya", "loadlibraryw", "ldrloaddll",
+        "ldrgetprocedureaddress", "getmodulehandlea", "getmodulehandlew",
     }),
 }
 
@@ -220,6 +233,10 @@ class _Evidence:
         self.pattern_hits: set[bytes] = set()
         self.import_hits: set[str] = set()
         self.tags: set[str] = set()
+        # Analysis-control flags are not threat tags and never affect verdict
+        # directly. They let deeper parsers suppress shallow lexical clusters
+        # when the same words occur only as inert script data/comments.
+        self.flags: set[str] = set()
         self._seen: set[tuple[str, str]] = set()
 
     def add(self, points: int, name: str, detail: str, category: str | None = None) -> None:
@@ -499,7 +516,11 @@ def _score_imports(all_imports: set[str], ev: _Evidence) -> dict[str, list[str]]
         elif category == "privilege":
             points = 6 + min(8, max(0, len(matched) - 1) * 2)
         elif category == "crypto":
-            points = 2 + min(4, max(0, len(matched) - 1) * 2)
+            points = 2 + min(6, max(0, len(matched) - 1) * 2)
+        elif category == "filesystem":
+            points = 2 + min(4, max(0, len(matched) - 2))
+        elif category == "resolver":
+            points = 4 + min(6, max(0, len(matched) - 1) * 2)
 
         ev.add(points, f"Suspicious {category.replace('_', ' ')} imports", ", ".join(matched[:8]), category)
         hits[category] = matched
@@ -509,6 +530,7 @@ def _score_imports(all_imports: set[str], ev: _Evidence) -> dict[str, list[str]]
 def _derive_tags(ev: _Evidence) -> set[str]:
     p = ev.pattern_hits
     i = ev.import_hits
+    suppress_script_patterns = "suppress_raw_script_combo_tags" in ev.flags
 
     injection_names = {
         b"virtualallocex", b"writeprocessmemory", b"createremotethread",
@@ -517,7 +539,7 @@ def _derive_tags(ev: _Evidence) -> set[str]:
     }
     injection_import_names = {x.decode() for x in injection_names}
     inj_count = len(p & injection_names) + len(i & injection_import_names)
-    if inj_count >= 3:
+    if inj_count >= 3 and not suppress_script_patterns:
         ev.tags.add("injection_chain")
 
     credential_names = {
@@ -532,22 +554,22 @@ def _derive_tags(ev: _Evidence) -> set[str]:
         "credenumeratea", "vaultenumeratevaults", "vaultopenvault", "vaultenumerateitems",
         "minidumpwritedump",
     })
-    if cred_count >= 2:
+    if cred_count >= 2 and not suppress_script_patterns:
         ev.tags.add("credential_theft_cluster")
 
-    if p & {
+    if (not suppress_script_patterns) and p & {
         b"set-mppreference -disablerealtimemonitoring",
         b"add-mppreference -exclusion", b"sc stop windefend",
     }:
         ev.tags.add("defense_disable")
 
-    if p & {b"vssadmin delete shadows", b"wmic shadowcopy delete"}:
+    if (not suppress_script_patterns) and p & {b"vssadmin delete shadows", b"wmic shadowcopy delete"}:
         ev.tags.add("destructive_recovery_inhibition")
 
-    if p & {b"discord.com/api/webhooks", b"api.telegram.org/bot"}:
+    if (not suppress_script_patterns) and p & {b"discord.com/api/webhooks", b"api.telegram.org/bot"}:
         ev.tags.add("exfiltration_channel")
 
-    if b"stratum+tcp://" in p and (b"xmrig" in p or b"cryptonight" in p):
+    if (not suppress_script_patterns) and b"stratum+tcp://" in p and (b"xmrig" in p or b"cryptonight" in p):
         ev.tags.add("miner_cluster")
 
     persist = p & {
@@ -555,7 +577,7 @@ def _derive_tags(ev: _Evidence) -> set[str]:
         b"schtasks /create", b"sc create", b"createservicew", b"createservicea",
     }
     active_persistence = persist & {b"schtasks /create", b"sc create", b"createservicew", b"createservicea"}
-    if len(persist) >= 3 or (active_persistence and len(persist) >= 2):
+    if (not suppress_script_patterns) and (len(persist) >= 3 or (active_persistence and len(persist) >= 2)):
         ev.tags.add("persistence_cluster")
 
     downloader_bits = 0
@@ -565,7 +587,7 @@ def _derive_tags(ev: _Evidence) -> set[str]:
         downloader_bits += 1
     if p & {b"-windowstyle hidden", b"-w hidden", b"-executionpolicy bypass", b"-ep bypass"}:
         downloader_bits += 1
-    if downloader_bits >= 3:
+    if downloader_bits >= 3 and not suppress_script_patterns:
         ev.tags.add("download_execute_evasion_chain")
 
     return ev.tags
@@ -912,6 +934,48 @@ def _static_verdict(ev: _Evidence) -> tuple[str, str, list[str]]:
     strong = set(tags)
     reasons: list[str] = []
 
+    # V4 family-agnostic high-confidence clusters.  These are behavioral
+    # combinations, not malware-family names and not score-only decisions.
+    if "ransomware_mass_encryption" in strong and ev.score >= 55:
+        reasons.append("bulk file enumeration + encryption + repeated overwrite behavior")
+        return "malicious", "high", reasons
+
+    if "ransomware_destructive" in strong and ev.score >= 50:
+        reasons.append("mass encryption combined with destructive/recovery-impact behavior")
+        return "malicious", "high", reasons
+
+    if "powershell_encoded_payload_chain" in strong and ev.score >= 50 and (cats & {"execution", "network", "injection", "evasion"}):
+        reasons.append("encoded/decoded PowerShell payload with executable or network behavior")
+        return "malicious", "high", reasons
+
+    if "powershell_download_execute_chain" in strong and ev.score >= 50 and (cats & {"network", "execution"}):
+        reasons.append("PowerShell download + dynamic execution chain")
+        return "malicious", "high", reasons
+
+    if "python_credential_exfil_cluster" in strong and ev.score >= 50:
+        reasons.append("Python credential-access indicators combined with network capability")
+        return "malicious", "high", reasons
+
+    if "python_input_capture_exfil_cluster" in strong and ev.score >= 50:
+        reasons.append("Python input-capture indicators combined with network capability")
+        return "malicious", "high", reasons
+
+    if "pyinstaller_embedded_behavior" in strong and ev.score >= 55 and (cats & {"credential_access", "network", "execution", "pyinstaller"}):
+        reasons.append("PyInstaller bundle contains corroborating embedded high-risk behavior")
+        return "malicious", "high", reasons
+
+    if "embedded_payload_loader" in strong and ev.score >= 55 and (cats & {"dropper", "loader", "packer", "execution", "injection"}):
+        reasons.append("loader/packer contains a recoverable embedded executable payload")
+        return "malicious", "high", reasons
+
+    if "dynamic_resolver_stager" in strong and "tiny_sparse_loader" in strong and ev.score >= 55:
+        reasons.append("tiny unsigned sparse-import executable with PEB/API-resolution stager behavior")
+        return "malicious", "high", reasons
+
+    if "dynamic_resolver_stager" in strong and ev.score >= 55 and (cats & {"injection", "network", "evasion", "dropper"}):
+        reasons.append("sparse-import stager with dynamic API-resolution and corroborating behavior")
+        return "malicious", "high", reasons
+
     if len(strong) >= 2 and ev.score >= 70:
         reasons.append("multiple independent high-risk behavior clusters")
         return "malicious", "high", reasons
@@ -1005,6 +1069,17 @@ def scan_file_path(path: str | os.PathLike[str], filename: str = "upload.bin", *
         pe_meta = _analyze_pe(path, ev)
         pyi_meta = _analyze_pyinstaller(path, ev, stream_meta.get("pyinstaller_markers", []))
 
+    # V4 deeper layers: PowerShell/Base64 deobfuscation, Python AST behavior,
+    # ransomware correlation, loader/stager code patterns, embedded compressed
+    # streams, and PyInstaller behavior correlation.  Nothing is executed.
+    advanced_meta = analyze_file(
+        path,
+        filename,
+        ev,
+        pe_meta=pe_meta,
+        pyinstaller_detected=bool(pyi_meta and pyi_meta.get("detected")),
+    )
+
     if total > 4096 and sample_entropy > 7.45:
         ev.add(12, "High entropy", f"sample entropy={sample_entropy:.3f}", "packer")
 
@@ -1024,6 +1099,8 @@ def scan_file_path(path: str | os.PathLike[str], filename: str = "upload.bin", *
         analysis["pe"] = pe_meta
     if pyi_meta is not None:
         analysis["pyinstaller"] = pyi_meta
+    if advanced_meta:
+        analysis["advanced"] = advanced_meta
 
     return {
         "sha256": sha256,

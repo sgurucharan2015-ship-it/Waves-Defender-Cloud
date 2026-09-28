@@ -86,7 +86,7 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="Waves Defence Cloud", version="3.3-advanced-static", lifespan=lifespan)
+app = FastAPI(title="Waves Defence Cloud", version="4.0-advanced-static", lifespan=lifespan)
 
 cors_origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "").split(",") if x.strip()]
 if cors_origins:
@@ -95,7 +95,10 @@ if cors_origins:
         allow_origins=cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-Aegis-Token", "X-File-Name", "X-Waves-Skip-Reputation"],
+        allow_headers=[
+            "Content-Type", "X-Aegis-Token", "X-File-Name",
+            "X-Waves-Skip-Reputation", "X-Waves-Static-Only",
+        ],
     )
 
 
@@ -104,7 +107,7 @@ async def root():
     return {
         "service": "Waves Defence Cloud",
         "ok": True,
-        "version": "3.3-advanced-static",
+        "version": "4.0-advanced-static",
         "health": "/health",
         "docs": "/docs",
         "auth_backend": "stateless-hmac-sha256",
@@ -223,6 +226,7 @@ async def scan_file(
     x_file_name: str | None = Header(default="upload.bin"),
     x_aegis_token: str | None = Header(default=None),
     x_waves_skip_reputation: str | None = Header(default=None),
+    x_waves_static_only: str | None = Header(default=None),
 ):
     require_api_or_master(x_aegis_token)
 
@@ -235,6 +239,15 @@ async def scan_file(
         (x_waves_skip_reputation or "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+    # X-Waves-Static-Only: 1 is the clean benchmark mode: Waves' own
+    # static engine only. It skips local hash reputation, MalwareBazaar,
+    # and optional ClamAV, while still performing every Waves static layer.
+    static_only = (
+        (x_waves_static_only or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if static_only:
+        skip_reputation = True
 
     # Reject known-oversize uploads before reading the body.
     cl = request.headers.get("content-length")
@@ -332,11 +345,15 @@ async def scan_file(
 
             # If ClamAV exists, scan the existing temp file directly instead of
             # constructing another full-size in-memory copy.
-            clam = await asyncio.to_thread(
-                clamav_scan_path,
-                tmp_path,
-                filename,
-            )
+            clam = None
+            if static_only:
+                print("[SCAN] ClamAV skipped by X-Waves-Static-Only", flush=True)
+            else:
+                clam = await asyncio.to_thread(
+                    clamav_scan_path,
+                    tmp_path,
+                    filename,
+                )
             if clam and clam.get("malicious"):
                 return {
                     **local,
