@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import hmac
 import os
+import shutil
+import subprocess
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,6 +29,46 @@ MASTER_TOKEN = os.getenv("AEGIS_TOKEN", "change-me")
 MAX_UPLOAD = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
 SCAN_CONCURRENCY = max(1, min(int(os.getenv("SCAN_CONCURRENCY", "1")), 2))
 scan_sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+ENGINE_VERSION = "5.0-advanced-static"
+
+
+def _detect_clamav() -> dict:
+    """Return non-sensitive ClamAV availability information for /health."""
+    path = shutil.which("clamscan")
+    if not path:
+        return {
+            "installed": False,
+            "path": None,
+            "version": None,
+        }
+
+    version = None
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        output = (result.stdout or result.stderr or "").strip()
+        if output:
+            version = output.splitlines()[0][:200]
+    except (OSError, subprocess.SubprocessError):
+        # Presence of clamscan is still useful even if version probing fails.
+        pass
+
+    return {
+        "installed": True,
+        "path": path,
+        "version": version,
+    }
+
+
+CLAMAV_STATUS = _detect_clamav()
+MALWAREBAZAAR_CONFIGURED = bool(
+    os.getenv("MALWAREBAZAAR_AUTH_KEY") or os.getenv("ABUSECH_AUTH_KEY")
+)
 
 # Existing Waves services remain unchanged.
 db = ThreatDB(DB_PATH)
@@ -86,7 +128,7 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="Waves Defence Cloud", version="4.0-advanced-static", lifespan=lifespan)
+app = FastAPI(title="Waves Defence Cloud", version=ENGINE_VERSION, lifespan=lifespan)
 
 cors_origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "").split(",") if x.strip()]
 if cors_origins:
@@ -107,7 +149,7 @@ async def root():
     return {
         "service": "Waves Defence Cloud",
         "ok": True,
-        "version": "4.0-advanced-static",
+        "version": ENGINE_VERSION,
         "health": "/health",
         "docs": "/docs",
         "auth_backend": "stateless-hmac-sha256",
@@ -125,6 +167,19 @@ async def root_head():
 async def health():
     return {
         "ok": True,
+        "service": "Waves Defence Cloud",
+        "version": ENGINE_VERSION,
+        "engine": {
+            "name": "Waves Advanced Static Engine",
+            "version": "V5",
+            "static_ready": True,
+            "max_upload_mb": MAX_UPLOAD // (1024 * 1024),
+            "scan_concurrency": SCAN_CONCURRENCY,
+        },
+        "clamav": CLAMAV_STATUS,
+        "malwarebazaar": {
+            "configured": MALWAREBAZAAR_CONFIGURED,
+        },
         "stats": db.stats(),
         "intel": updater.status(),
         "auth": keys.status(),
@@ -312,10 +367,16 @@ async def scan_file(
             )
 
             if skip_reputation:
-                print(
-                    "[SCAN] reputation skipped by X-Waves-Skip-Reputation",
-                    flush=True,
-                )
+                if static_only:
+                    print(
+                        "[SCAN] reputation skipped by X-Waves-Static-Only",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[SCAN] reputation skipped by X-Waves-Skip-Reputation",
+                        flush=True,
+                    )
             else:
                 row = db.get_hash(sha256)
                 if row:
