@@ -28,8 +28,10 @@ MAX_LAYER_OUTPUT = 3 * MB
 MAX_LAYER_TOTAL = 12 * MB
 MAX_COMPRESSED_CANDIDATES = 48
 MAX_COMPRESSED_INPUT = 2 * MB
-MAX_EMBEDDED_PE_HITS = 8
+MAX_EMBEDDED_PE_HITS = 16
 MAX_EP_CODE = 8192
+MAX_OVERLAY_MZ_CANDIDATES = 256
+MAX_OVERLAY_TEXT_BYTES = 8 * MB
 
 _SCRIPT_EXTS = {".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta", ".py", ".pyw"}
 
@@ -446,7 +448,9 @@ def _analyze_powershell(data: bytes, ev: Any) -> dict[str, Any]:
     code_norm = _normalize_ps(code_text)
     code_features = _scan_text_features(code_norm, ev, "PowerShell code")
     layer_features = _scan_base64_layers(data, ev, "PowerShell")
-    features = set(code_features) | set(layer_features)
+    constructed_meta = _scan_powershell_constructed_base64(text, ev)
+    constructed_features = set(constructed_meta.get("features") or [])
+    features = set(code_features) | set(layer_features) | constructed_features
 
     raw_has_suspicious = any(x in full_norm for x in (
         "invoke-expression", "downloadstring", "frombase64string", "virtualallocex",
@@ -490,9 +494,17 @@ def _analyze_powershell(data: bytes, ev: Any) -> dict[str, Any]:
     # Decoded content is only elevated to a malicious chain when the outer
     # script actively decodes/executes it. Merely storing suspicious-looking
     # Base64 data remains suspicious rather than malicious.
-    if code_decode and code_exec and "decoded_base64" in features:
-        if features & {"dynamic_execution", "network", "memory_execution", "evasion"}:
+    if code_decode and code_exec and ("decoded_base64" in features or constructed_meta.get("decoded_candidates")):
+        if features & {"dynamic_execution", "network", "memory_execution", "evasion", "decoded_pe"}:
             ev.tags.add("powershell_encoded_payload_chain")
+
+    # V5 fallback for very large encoded droppers whose payload is deliberately
+    # split/obfuscated enough that a bounded decoder cannot fully reconstruct it.
+    # Active decode + active execution + a very large encoded body is itself a
+    # meaningful chain, but inert string-only AV tests are still suppressed.
+    if code_decode and code_exec and huge_b64 and len(data) >= 128 * 1024:
+        ev.tags.add("powershell_encoded_payload_chain")
+        _add(ev, 24, "Large active encoded PowerShell chain", "active Base64 decode + dynamic execution in a large script", "execution")
     if code_exec and {"network", "dynamic_execution"}.issubset(code_features) and (
         "evasion" in code_features or "encoded_or_compressed" in code_features or "obfuscation" in features
     ):
@@ -533,6 +545,7 @@ def _analyze_powershell(data: bytes, ev: Any) -> dict[str, Any]:
         "large_base64": huge_b64,
         "active_base64_decode": code_decode,
         "active_dynamic_execution": code_exec,
+        "constructed_base64": constructed_meta,
     }
 
 
@@ -547,6 +560,206 @@ def _find_valid_embedded_pes(data: bytes, start_at: int = 1) -> list[int]:
             hits.append(pos)
         pos += 2
     return hits
+
+
+def _scan_overlay_deep(path: str, pe_meta: dict[str, Any], ev: Any) -> dict[str, Any]:
+    """Inspect the *entire* PE overlay without executing or loading it.
+
+    V4 only inspected a bounded prefix for some operations.  V5 walks the
+    complete overlay with mmap, validates embedded PE headers where possible,
+    samples text throughout the overlay, and correlates the result with the
+    outer loader's imports/TLS/evasion profile.
+    """
+    size = os.path.getsize(path)
+    overlay_size = int(pe_meta.get("overlay_size") or 0)
+    overlay_start = int(pe_meta.get("overlay_start") or max(0, size - overlay_size))
+    if overlay_size <= 0 or overlay_start < 0 or overlay_start >= size:
+        return {"overlay_scanned": False}
+
+    ratio = overlay_size / max(1, size)
+    mz_candidates = 0
+    valid_pes: list[int] = []
+    installer_markers: set[str] = set()
+    overlay_features: set[str] = set()
+    archive_types: set[str] = set()
+    sampled = 0
+
+    import_groups = pe_meta.get("suspicious_imports") or {}
+    resolver_imports = set(import_groups.get("resolver") or [])
+    evasion_imports = set(import_groups.get("evasion") or [])
+    filesystem_imports = set(import_groups.get("filesystem") or [])
+    tls_present = bool(pe_meta.get("tls_present"))
+    signed = bool(pe_meta.get("authenticode_present"))
+
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        # Search every byte of the overlay for candidate nested PE images.
+        pos = overlay_start
+        while mz_candidates < MAX_OVERLAY_MZ_CANDIDATES and len(valid_pes) < MAX_EMBEDDED_PE_HITS:
+            pos = mm.find(b"MZ", pos, size)
+            if pos < 0:
+                break
+            mz_candidates += 1
+            if _looks_like_pe(mm, pos):
+                valid_pes.append(pos)
+            pos += 2
+
+        # Identify common benign/self-extracting container technology.  This
+        # doesn't make a file benign; it simply stops container structure alone
+        # from being promoted to malware.
+        marker_map = {
+            b"Nullsoft": "NSIS",
+            b"Inno Setup": "Inno Setup",
+            b"InstallShield": "InstallShield",
+            b"7-Zip": "7-Zip/SFX",
+            b"WinRAR SFX": "WinRAR SFX",
+            b"SFX module": "SFX",
+        }
+        # Archive signatures in the overlay are also reported as structure.
+        sigs = {
+            b"PK\x03\x04": "zip",
+            b"7z\xbc\xaf\x27\x1c": "7z",
+            b"Rar!\x1a\x07": "rar",
+            b"MSCF": "cab",
+        }
+        for sig, label in sigs.items():
+            if mm.find(sig, overlay_start, size) >= 0:
+                archive_types.add(label)
+        for marker, label in marker_map.items():
+            if mm.find(marker, overlay_start, size) >= 0:
+                installer_markers.add(label)
+
+        # Sample text across the complete overlay instead of reading one fixed
+        # prefix.  At most MAX_OVERLAY_TEXT_BYTES are copied in total.
+        if overlay_size:
+            sample_budget = min(MAX_OVERLAY_TEXT_BYTES, overlay_size)
+            chunk = 512 * 1024
+            if sample_budget <= chunk:
+                offsets = [overlay_start]
+            else:
+                count = max(2, sample_budget // chunk)
+                span = max(1, overlay_size - chunk)
+                offsets = [overlay_start + int(span * i / max(1, count - 1)) for i in range(count)]
+            seen_offsets: set[int] = set()
+            for off in offsets:
+                off = max(overlay_start, min(off, max(overlay_start, size - chunk)))
+                if off in seen_offsets or sampled >= sample_budget:
+                    continue
+                seen_offsets.add(off)
+                take = min(chunk, sample_budget - sampled, size - off)
+                if take <= 0:
+                    continue
+                blob = bytes(mm[off:off + take])
+                sampled += len(blob)
+                txt = _decode_text(blob)
+                overlay_features |= _scan_text_features(txt, ev, "PE overlay deep sample")
+                pycats = _python_blob_categories(blob)
+                if pycats:
+                    overlay_features.update(f"python:{x}" for x in pycats)
+
+    huge_overlay = overlay_size >= 4 * MB and ratio >= 0.50
+    outer_loader = bool(resolver_imports) or "dynamic_resolver_stager" in ev.tags
+    outer_evasion = tls_present or bool(evasion_imports) or "dynamic_resolver_stager" in ev.tags
+    operational = bool(set(ev.categories) & {"network", "filesystem", "execution", "injection", "credential_access"})
+    common_installer = bool(installer_markers)
+
+    if valid_pes:
+        _add(ev, 28, "Validated executable payload in overlay", f"{len(valid_pes)} valid nested PE image(s) found across full overlay", "dropper")
+        if outer_loader and outer_evasion:
+            ev.tags.add("validated_embedded_pe_dropper")
+            _add(ev, 24, "Embedded-PE loader/dropper cluster", "validated nested executable + resolver/loader + evasion/TLS evidence", "loader")
+
+    # Some loaders deliberately corrupt, encrypt, or wrap the inner PE, so a
+    # literal MZ marker may be present without a currently parseable PE header.
+    # Promote only when several independent outer-loader conditions agree and
+    # the file does NOT identify as a common installer/SFX container.
+    if huge_overlay and mz_candidates and outer_loader and outer_evasion and operational and not common_installer and not signed:
+        ev.tags.add("opaque_overlay_dropper_cluster")
+        _add(
+            ev,
+            34,
+            "Opaque overlay loader/dropper cluster",
+            f"overlay={overlay_size} bytes ({ratio:.1%}), MZ candidates={mz_candidates}, resolver/evasion + operational evidence",
+            "dropper",
+        )
+
+    if huge_overlay and (valid_pes or mz_candidates >= 1) and outer_loader and outer_evasion and operational:
+        ev.tags.add("multi_stage_loader_cluster")
+        _add(ev, 18, "Multi-stage loader structure", "large appended payload/container + dynamic resolution/evasion + operational evidence", "loader")
+
+    if archive_types:
+        _add(ev, 2, "Overlay archive/container data", ", ".join(sorted(archive_types)), "structure")
+    if installer_markers:
+        _add(ev, 0, "Installer/SFX marker", ", ".join(sorted(installer_markers)), "structure")
+
+    return {
+        "overlay_scanned": True,
+        "overlay_start": overlay_start,
+        "overlay_size": overlay_size,
+        "overlay_ratio": round(ratio, 4),
+        "mz_candidates": mz_candidates,
+        "valid_embedded_pe_offsets": valid_pes,
+        "archive_types": sorted(archive_types),
+        "installer_markers": sorted(installer_markers),
+        "sampled_text_bytes": sampled,
+        "overlay_features": sorted(overlay_features),
+        "outer_loader": outer_loader,
+        "outer_evasion": outer_evasion,
+        "operational_evidence": operational,
+    }
+
+
+def _scan_powershell_constructed_base64(text: str, ev: Any) -> dict[str, Any]:
+    """Recover common PowerShell Base64 assembled from quoted fragments."""
+    # One long quoted string OR several quoted Base64 fragments joined by +.
+    quoted = re.compile(r"(['\"])([A-Za-z0-9+/=]{48,})\1")
+    fragments = [(m.start(), m.end(), m.group(2)) for m in quoted.finditer(text)]
+    candidates: list[str] = []
+    i = 0
+    while i < len(fragments):
+        start, end, val = fragments[i]
+        joined = val
+        j = i + 1
+        last_end = end
+        while j < len(fragments):
+            nstart, nend, nval = fragments[j]
+            between = text[last_end:nstart]
+            if len(between) > 96 or "+" not in between or re.sub(r"[\s+()]", "", between):
+                break
+            joined += nval
+            last_end = nend
+            j += 1
+        if len(joined) >= 160:
+            candidates.append(joined)
+        i = max(i + 1, j)
+
+    decoded = 0
+    features: set[str] = set()
+    for val in sorted(candidates, key=len, reverse=True)[:16]:
+        raw = val.encode("ascii", "ignore")
+        raw = raw[:MAX_B64_INPUT]
+        raw = raw[: len(raw) - (len(raw) % 4)]
+        if len(raw) < 160:
+            continue
+        try:
+            out = base64.b64decode(raw, validate=False)[:MAX_LAYER_OUTPUT]
+        except Exception:
+            continue
+        if len(out) < 64:
+            continue
+        decoded += 1
+        _add(ev, 12, "Constructed PowerShell Base64 decoded", f"decoded {len(out)} bytes from quoted/concatenated fragments", "encoding")
+        features |= _scan_text_features(_decode_text(out), ev, "constructed-Base64")
+        unpacked, kind = _decompress_if_wrapped(out)
+        if unpacked:
+            _add(ev, 12, "Constructed Base64 compressed layer decoded", f"{kind}, {len(unpacked)} bytes", "encoding")
+            features |= _scan_text_features(_decode_text(unpacked), ev, f"constructed-{kind}")
+            if _looks_like_pe(unpacked):
+                features.add("decoded_pe")
+                _add(ev, 24, "PowerShell decoded PE payload", f"valid PE recovered from constructed Base64/{kind}", "dropper")
+        elif _looks_like_pe(out):
+            features.add("decoded_pe")
+            _add(ev, 24, "PowerShell decoded PE payload", "valid PE recovered from constructed Base64", "dropper")
+    return {"decoded_candidates": decoded, "features": sorted(features)}
 
 
 def _minimal_pe_layout(data: bytes) -> dict[str, Any] | None:
@@ -785,6 +998,7 @@ def analyze_file(path: str, filename: str, ev: Any, *, pe_meta: dict[str, Any] |
 
     if pe_meta is not None:
         meta["pe_loader"] = _analyze_pe_loader(path, pe_meta, ev)
+        meta["overlay_deep"] = _scan_overlay_deep(path, pe_meta, ev)
         compressed_meta = _scan_compressed_streams(path, ev)
         meta["compressed_layers"] = compressed_meta
 

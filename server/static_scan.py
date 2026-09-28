@@ -766,6 +766,7 @@ def _analyze_pe(path: str, ev: _Evidence) -> dict:
                 ev.add(2, "No embedded Authenticode signature", "PE has no certificate table", "structure")
 
             tls_rva, tls_size = directory(9)
+            meta["tls_present"] = bool(tls_rva and tls_size)
             if tls_rva and tls_size:
                 ev.add(6, "TLS directory present", "May contain pre-entry callbacks", "evasion")
 
@@ -777,6 +778,7 @@ def _analyze_pe(path: str, ev: _Evidence) -> dict:
                 meta["dotnet"] = False
 
             overlay_size = max(0, file_size - overlay_end)
+            meta["overlay_start"] = overlay_end
             meta["overlay_size"] = overlay_size
             if overlay_size >= 512 * 1024 and overlay_size >= max(1, file_size // 5):
                 ev.add(12, "Large PE overlay", f"{overlay_size} bytes appended", "packer")
@@ -974,6 +976,22 @@ def _static_verdict(ev: _Evidence) -> tuple[str, str, list[str]]:
 
     if "dynamic_resolver_stager" in strong and ev.score >= 55 and (cats & {"injection", "network", "evasion", "dropper"}):
         reasons.append("sparse-import stager with dynamic API-resolution and corroborating behavior")
+        return "malicious", "high", reasons
+
+    # V5: deep container/loader correlations.  These rules intentionally do
+    # not promote a file merely because it has a large overlay or is packed.
+    # They require a loader/resolver/evasion cluster plus payload/container
+    # evidence and another operational category.
+    if "validated_embedded_pe_dropper" in strong and ev.score >= 70 and (cats & {"loader", "resolver", "evasion"}):
+        reasons.append("outer loader/evasion behavior combined with a validated embedded PE payload")
+        return "malicious", "high", reasons
+
+    if "opaque_overlay_dropper_cluster" in strong and ev.score >= 78 and {"dropper", "loader", "evasion"}.issubset(cats):
+        reasons.append("large opaque overlay + embedded executable marker + dynamic loader/evasion behavior")
+        return "malicious", "high", reasons
+
+    if "multi_stage_loader_cluster" in strong and ev.score >= 75 and len(cats & {"network", "filesystem", "execution", "injection", "credential_access"}) >= 1:
+        reasons.append("multi-stage loader/dropper structure with corroborating operational behavior")
         return "malicious", "high", reasons
 
     if len(strong) >= 2 and ev.score >= 70:
