@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,14 +17,14 @@ from pydantic import BaseModel, Field
 from db import ThreatDB
 from providers import MalwareBazaar, SHA256_RE
 from stateless_auth import Principal, StatelessAuthError, StatelessKeyManager
-from static_scan import clamav_scan, scan_bytes
+from static_scan import clamav_scan_path, scan_file_path
 from updater import IntelUpdater
 
 load_dotenv()
 
 DB_PATH = os.getenv("AEGIS_DB", "/tmp/aegis.db")
 MASTER_TOKEN = os.getenv("AEGIS_TOKEN", "change-me")
-MAX_UPLOAD = int(os.getenv("MAX_UPLOAD_MB", "16")) * 1024 * 1024
+MAX_UPLOAD = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
 SCAN_CONCURRENCY = max(1, min(int(os.getenv("SCAN_CONCURRENCY", "1")), 2))
 scan_sem = asyncio.Semaphore(SCAN_CONCURRENCY)
 
@@ -223,35 +225,122 @@ async def scan_file(
 ):
     require_api_or_master(x_aegis_token)
 
+    filename = x_file_name or "upload.bin"
+
+    # Reject known-oversize uploads before reading the body.
     cl = request.headers.get("content-length")
     if cl:
         try:
             if int(cl) > MAX_UPLOAD:
-                raise HTTPException(413, "File too large")
+                raise HTTPException(
+                    413,
+                    f"File too large. Maximum upload is {MAX_UPLOAD // (1024 * 1024)} MB",
+                )
         except ValueError:
             raise HTTPException(400, "Invalid Content-Length")
 
     async with scan_sem:
-        data = await request.body()
-        if len(data) > MAX_UPLOAD:
-            raise HTTPException(413, "File too large")
+        # IMPORTANT:
+        # Do NOT use await request.body() here. That buffers the entire upload
+        # in RAM. Stream it to /tmp in chunks and calculate SHA-256 as it arrives.
+        suffix = Path(filename).suffix[:16]
+        fd, tmp_path = tempfile.mkstemp(prefix="waves_scan_", suffix=suffix)
+        os.close(fd)
 
-        local = scan_bytes(data, x_file_name or "upload.bin")
-        row = db.get_hash(local["sha256"])
-        if row:
-            return {**local, "verdict": "malicious", "source": row["source"], "label": row["label"]}
+        total = 0
+        hasher = hashlib.sha256()
 
-        live = await mb.lookup_hash(local["sha256"])
-        if live:
-            db.upsert_hash(live["sha256"], live["label"], live["source"], live.get("first_seen"), live.get("last_seen"))
-            return {**local, "verdict": "malicious", "source": live["source"], "label": live["label"]}
+        try:
+            print(f"[SCAN] upload starting: {filename}", flush=True)
 
-        clam = clamav_scan(data, x_file_name or "upload.bin")
-        if clam and clam.get("malicious"):
-            return {**local, "verdict": "malicious", "source": "ClamAV", "label": clam.get("signature")}
+            with open(tmp_path, "wb") as out:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
 
-        verdict = "suspicious" if local["score"] >= 35 else "unknown"
-        return {**local, "verdict": verdict, "source": "static-analysis"}
+                    total += len(chunk)
+                    if total > MAX_UPLOAD:
+                        raise HTTPException(
+                            413,
+                            f"File too large. Maximum upload is {MAX_UPLOAD // (1024 * 1024)} MB",
+                        )
+
+                    hasher.update(chunk)
+                    out.write(chunk)
+
+            sha256 = hasher.hexdigest()
+            print(
+                f"[SCAN] upload complete: {filename}, "
+                f"{total / (1024 * 1024):.2f} MB, sha256={sha256}",
+                flush=True,
+            )
+
+            # Static analysis is synchronous/CPU work. Run it off the asyncio
+            # event loop so /health and other requests remain responsive.
+            print("[SCAN] static analysis starting", flush=True)
+            local = await asyncio.to_thread(
+                scan_file_path,
+                tmp_path,
+                filename,
+                precomputed_sha256=sha256,
+            )
+            print(
+                f"[SCAN] static analysis complete: score={local['score']}",
+                flush=True,
+            )
+
+            row = db.get_hash(sha256)
+            if row:
+                return {
+                    **local,
+                    "verdict": "malicious",
+                    "source": row["source"],
+                    "label": row["label"],
+                }
+
+            live = await mb.lookup_hash(sha256)
+            if live:
+                db.upsert_hash(
+                    live["sha256"],
+                    live["label"],
+                    live["source"],
+                    live.get("first_seen"),
+                    live.get("last_seen"),
+                )
+                return {
+                    **local,
+                    "verdict": "malicious",
+                    "source": live["source"],
+                    "label": live["label"],
+                }
+
+            # If ClamAV exists, scan the existing temp file directly instead of
+            # constructing another full-size in-memory copy.
+            clam = await asyncio.to_thread(
+                clamav_scan_path,
+                tmp_path,
+                filename,
+            )
+            if clam and clam.get("malicious"):
+                return {
+                    **local,
+                    "verdict": "malicious",
+                    "source": "ClamAV",
+                    "label": clam.get("signature"),
+                }
+
+            verdict = "suspicious" if local["score"] >= 35 else "unknown"
+            return {
+                **local,
+                "verdict": verdict,
+                "source": "static-analysis",
+            }
+
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 @app.get("/v1/url/check")
