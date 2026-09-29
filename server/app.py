@@ -29,7 +29,7 @@ MASTER_TOKEN = os.getenv("AEGIS_TOKEN", "change-me")
 MAX_UPLOAD = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
 SCAN_CONCURRENCY = max(1, min(int(os.getenv("SCAN_CONCURRENCY", "1")), 2))
 scan_sem = asyncio.Semaphore(SCAN_CONCURRENCY)
-ENGINE_VERSION = "5.0-advanced-static"
+ENGINE_VERSION = "5.1-hardening"
 
 
 def _detect_clamav() -> dict:
@@ -171,10 +171,19 @@ async def health():
         "version": ENGINE_VERSION,
         "engine": {
             "name": "Waves Advanced Static Engine",
-            "version": "V5",
+            "version": "V5.1",
             "static_ready": True,
             "max_upload_mb": MAX_UPLOAD // (1024 * 1024),
             "scan_concurrency": SCAN_CONCURRENCY,
+            "capabilities": [
+                "pe-structure",
+                "pyinstaller",
+                "powershell-layers",
+                "packed-overlay",
+                "process-injection-correlation",
+                "python-ransomware-dataflow",
+                "content-script-sniffing",
+            ],
         },
         "clamav": CLAMAV_STATUS,
         "malwarebazaar": {

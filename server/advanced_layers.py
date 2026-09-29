@@ -330,6 +330,7 @@ def _analyze_python(path: str, data: bytes, ev: Any) -> dict[str, Any]:
     write_modes = 0
     loops = 0
     loop_encrypt_write = False
+    interprocedural_mass_encrypt = False
 
     def subtree_call_names(node: ast.AST) -> set[str]:
         names = set()
@@ -337,6 +338,62 @@ def _analyze_python(path: str, data: bytes, ev: Any) -> dict[str, Any]:
             if isinstance(x, ast.Call):
                 names.add(_python_call_name(x.func).lower())
         return names
+
+    def assigned_names(node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, (ast.Tuple, ast.List)):
+            out: set[str] = set()
+            for e in node.elts:
+                out |= assigned_names(e)
+            return out
+        return set()
+
+    enum_calls = {
+        "os.walk", "os.scandir", "os.listdir", "glob.glob", "glob.iglob",
+        "pathlib.path.rglob", "pathlib.path.glob", "path.rglob", "path.glob", "rglob", "glob",
+    }
+
+    def is_enum_call_name(name: str) -> bool:
+        return name in enum_calls or name.endswith((".rglob", ".glob", ".walk", ".scandir", ".listdir"))
+
+    # Function summaries let us connect:
+    #   for file in find_all_files(root): encrypt_file(file)
+    # even though traversal and encryption happen in separate functions.
+    function_summaries: dict[str, dict[str, Any]] = {}
+    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        params = {a.arg for a in fn.args.args}
+        fn_calls = subtree_call_names(fn)
+        does_encrypt = any(x.endswith(".encrypt") or x in {"fernet.encrypt", "cipher.encryptor"} for x in fn_calls)
+        does_enum = any(is_enum_call_name(x) for x in fn_calls)
+        yields_values = any(isinstance(x, (ast.Yield, ast.YieldFrom)) for x in ast.walk(fn))
+        writes_param = False
+        destructive_param = False
+        for x in ast.walk(fn):
+            if isinstance(x, ast.Call):
+                cname = _python_call_name(x.func).lower()
+                if cname == "open" and x.args:
+                    target = x.args[0]
+                    mode = None
+                    if len(x.args) >= 2 and isinstance(x.args[1], ast.Constant) and isinstance(x.args[1].value, str):
+                        mode = x.args[1].value.lower()
+                    for kw in x.keywords:
+                        if kw.arg == "mode" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                            mode = kw.value.value.lower()
+                    if isinstance(target, ast.Name) and target.id in params and mode and any(c in mode for c in ("w", "a", "x")):
+                        writes_param = True
+                if isinstance(x.func, ast.Attribute) and isinstance(x.func.value, ast.Name) and x.func.value.id in params:
+                    if x.func.attr.lower() in {"write_bytes", "write_text"}:
+                        writes_param = True
+                    if x.func.attr.lower() in {"unlink", "rename", "replace"}:
+                        destructive_param = True
+        function_summaries[fn.name.lower()] = {
+            "encrypts": does_encrypt,
+            "enumerates": does_enum,
+            "yields": yields_values,
+            "writes_param": writes_param,
+            "destructive_param": destructive_param,
+        }
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -363,6 +420,28 @@ def _analyze_python(path: str, data: bytes, ev: Any) -> dict[str, Any]:
             if has_enc and has_write:
                 loop_encrypt_write = True
 
+            if isinstance(node, ast.For):
+                loop_vars = assigned_names(node.target)
+                iter_name = ""
+                if isinstance(node.iter, ast.Call):
+                    iter_name = _python_call_name(node.iter.func).lower()
+                iter_is_bulk = is_enum_call_name(iter_name) or bool(
+                    iter_name in function_summaries
+                    and function_summaries[iter_name].get("enumerates")
+                    and function_summaries[iter_name].get("yields")
+                )
+                if iter_is_bulk and loop_vars:
+                    for x in ast.walk(node):
+                        if not isinstance(x, ast.Call):
+                            continue
+                        cname = _python_call_name(x.func).lower()
+                        summary = function_summaries.get(cname)
+                        if not summary or not summary.get("encrypts") or not summary.get("writes_param"):
+                            continue
+                        if any(isinstance(arg, ast.Name) and arg.id in loop_vars for arg in x.args):
+                            interprocedural_mass_encrypt = True
+                            break
+
     low_imports = " ".join(sorted(imports))
     low_calls = " ".join(sorted(calls))
     all_text = "\n".join(strings).lower()
@@ -374,11 +453,7 @@ def _analyze_python(path: str, data: bytes, ev: Any) -> dict[str, Any]:
         or any(x in low_calls for x in ("cipher.encryptor", "aes.new", "chacha20poly1305"))
     )
     keygen = any("generate_key" in x or "secrets.token_bytes" in x or "os.urandom" in x for x in calls)
-    enum_calls = {
-        "os.walk", "os.scandir", "os.listdir", "glob.glob", "glob.iglob",
-        "pathlib.path.rglob", "pathlib.path.glob", "path.rglob", "path.glob", "rglob", "glob",
-    }
-    enumeration = any(x in calls for x in enum_calls) or any(x.endswith((".rglob", ".glob")) for x in calls)
+    enumeration = any(is_enum_call_name(x) for x in calls) or any(v.get("enumerates") for v in function_summaries.values())
     write = write_modes > 0 or any(x.endswith((".write", ".write_bytes", ".write_text")) for x in calls)
     destructive = any(x.endswith((".remove", ".unlink", ".replace", ".rename")) for x in calls) or any(x in calls for x in {"os.remove", "os.unlink", "os.replace", "os.rename"})
     ext_hits = sorted({m.group(0).lower() for m in _HIGH_VALUE_EXT_RE.finditer(all_text)})
@@ -408,13 +483,15 @@ def _analyze_python(path: str, data: bytes, ev: Any) -> dict[str, Any]:
         _add(ev, 14, "High-value file extension targeting", f"{len(ext_hits)} document/data extension types referenced", "ransomware")
     if loop_encrypt_write:
         _add(ev, 26, "Encryption inside file-processing loop", "repeated encryption + write behavior in loop", "ransomware")
+    if interprocedural_mass_encrypt:
+        _add(ev, 30, "Interprocedural mass-encryption chain", "bulk enumerator feeds each discovered file into an encryption helper that overwrites the target", "ransomware")
     if destructive and crypto:
         _add(ev, 14, "Encrypted-file replacement/deletion behavior", "encryption combined with replacement/delete/rename operations", "destructive")
     if ransom_markers >= 2:
         _add(ev, 20, "Ransom-note indicators", "multiple encryption/recovery/payment strings", "ransomware")
         ev.tags.add("ransom_note_cluster")
 
-    if crypto and write and enumeration and (loop_encrypt_write or len(ext_hits) >= 4):
+    if crypto and write and enumeration and (loop_encrypt_write or interprocedural_mass_encrypt or len(ext_hits) >= 4):
         ev.tags.add("ransomware_mass_encryption")
         _add(ev, 22, "Mass-encryption behavior cluster", "encryption + bulk enumeration + repeated/targeted file overwrite", "ransomware")
     if "ransomware_mass_encryption" in ev.tags and (destructive or ransom_markers >= 2):
@@ -433,9 +510,10 @@ def _analyze_python(path: str, data: bytes, ev: Any) -> dict[str, Any]:
         "loops": loops,
         "high_value_extensions": ext_hits[:30],
         "features": sorted(py_features),
+        "function_summaries": function_summaries,
+        "interprocedural_mass_encryption": interprocedural_mass_encrypt,
     })
     return meta
-
 
 def _analyze_powershell(data: bytes, ev: Any) -> dict[str, Any]:
     text = _decode_text(data)
@@ -852,6 +930,29 @@ def _analyze_pe_loader(path: str, pe_meta: dict[str, Any], ev: Any) -> dict[str,
     # Native ransomware-like correlation from imports.  Individual filesystem
     # and crypto APIs are common; the dangerous signal is their combination.
     import_groups = pe_meta.get("suspicious_imports") or {}
+
+    # Thread-context hijacking / process manipulation.  V5 recognized the
+    # individual APIs but did not join them into a high-risk cluster.
+    injection_hits = set(import_groups.get("injection") or [])
+    resolver_hits = set(import_groups.get("resolver") or [])
+    execution_hits = set(import_groups.get("execution") or [])
+    has_process_access = "openprocess" in injection_hits or b"openprocess" in getattr(ev, "pattern_hits", set())
+    thread_context = "setthreadcontext" in injection_hits or b"setthreadcontext" in getattr(ev, "pattern_hits", set())
+    thread_control = bool(injection_hits & {"suspendthread", "resumethread"}) or bool(
+        getattr(ev, "pattern_hits", set()) & {b"suspendthread", b"resumethread"}
+    )
+    dynamic_resolution = bool(resolver_hits) or "dynamic_resolver_stager" in getattr(ev, "tags", set())
+    operational_categories = set(getattr(ev, "categories", set())) & {"network", "filesystem", "discovery", "execution"}
+    if has_process_access and thread_context and thread_control and dynamic_resolution and operational_categories:
+        ev.tags.add("process_thread_hijack_cluster")
+        _add(
+            ev,
+            28,
+            "Process thread-hijack/manipulation cluster",
+            "process access + thread suspend/resume/context manipulation + dynamic API resolution + operational behavior",
+            "injection",
+        )
+
     crypto_hits = set(import_groups.get("crypto") or [])
     fs_hits = set(import_groups.get("filesystem") or [])
     enum_hits = fs_hits & {"findfirstfilea", "findfirstfilew", "findnextfilea", "findnextfilew"}
@@ -974,17 +1075,54 @@ def _scan_compressed_streams(path: str, ev: Any) -> dict[str, Any]:
     }
 
 
+def _sniff_script_type(path: str, filename: str) -> str | None:
+    """Recognize obvious text scripts even when the filename extension is disguised."""
+    ext = Path(filename).suffix.lower()
+    if ext in _SCRIPT_EXTS:
+        return ext
+    try:
+        data = _read_bounded(path, 256 * 1024)
+    except OSError:
+        return None
+    if not data or b"\x00" in data[:4096]:
+        # UTF-16 PowerShell is handled below via text decoding; a binary-looking
+        # file with many NULs should not be guessed as Python/JS just from words.
+        text = _decode_text(data)
+    else:
+        text = _decode_text(data)
+    low = text.lower()
+    if ("from cryptography.fernet import" in low or "import cryptography" in low or
+        ("def " in low and "import " in low and ("os." in low or "pathlib" in low))):
+        return ".py"
+    ps_signals = sum(x in low for x in (
+        "frombase64string", "invoke-expression", "new-object net.webclient",
+        "invoke-webrequest", "-executionpolicy", "$env:", "[convert]::",
+    ))
+    if ps_signals >= 2 or low.lstrip().startswith("#requires"):
+        return ".ps1"
+    if "wscript.shell" in low and ("createobject" in low or "activexobject" in low):
+        return ".vbs"
+    if "activexobject" in low and ("wscript" in low or "powershell" in low):
+        return ".js"
+    return None
+
+
 def analyze_file(path: str, filename: str, ev: Any, *, pe_meta: dict[str, Any] | None = None, pyinstaller_detected: bool = False) -> dict[str, Any]:
     """Run advanced non-executing analysis and add evidence into ``ev``.
 
     The caller owns final verdict policy.  This function returns metadata only.
     """
     ext = Path(filename).suffix.lower()
+    sniffed_ext = _sniff_script_type(path, filename)
+    analysis_ext = ext if ext in _SCRIPT_EXTS else sniffed_ext
     meta: dict[str, Any] = {}
+    if sniffed_ext and sniffed_ext != ext:
+        meta["content_detected_script_type"] = sniffed_ext
+        _add(ev, 2, "Script content with disguised extension", f"content resembles {sniffed_ext} while filename ends with {ext or '<none>'}", "evasion")
 
-    if ext in _SCRIPT_EXTS:
+    if analysis_ext in _SCRIPT_EXTS:
         data = _read_bounded(path, MAX_SCRIPT_BYTES)
-        if ext in {".ps1", ".psm1", ".psd1"}:
+        if analysis_ext in {".ps1", ".psm1", ".psd1"}:
             ps_meta = _analyze_powershell(data, ev)
             meta["powershell"] = ps_meta
             meta["script_features"] = ps_meta.get("features", [])
@@ -993,7 +1131,7 @@ def analyze_file(path: str, filename: str, ev: Any, *, pe_meta: dict[str, Any] |
             generic = _scan_text_features(text, ev, "script")
             b64 = _scan_base64_layers(data, ev, "script")
             meta["script_features"] = sorted(generic | b64)
-            if ext in {".py", ".pyw"}:
+            if analysis_ext in {".py", ".pyw"}:
                 meta["python"] = _analyze_python(path, data, ev)
 
     if pe_meta is not None:

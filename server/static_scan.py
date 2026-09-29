@@ -150,7 +150,11 @@ WIDE_MAP = {
 WIDE_RE = re.compile(b"|".join(re.escape(x) for x in sorted(WIDE_MAP, key=len, reverse=True)))
 
 ASCII_URL_RE = re.compile(rb"https?://[^\s\x00\"'<>]{6,240}", re.I)
-IPV4_RE = re.compile(rb"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
+IPV4_RE = re.compile(
+    rb"(?<![0-9])(?:"
+    rb"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\."
+    rb"){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?![0-9])"
+)
 
 # Imports are scored by category, not one-by-one, to reduce false positives.
 IMPORT_CATEGORIES: dict[str, tuple[int, set[str]]] = {
@@ -761,9 +765,15 @@ def _analyze_pe(path: str, ev: _Evidence) -> dict:
 
             security_off, security_size = directory(4)  # file offset, not RVA
             signed = bool(security_off and security_size and security_off < file_size)
+            # Backward-compatible field: this means a PE certificate table is
+            # present.  It does NOT prove that the Authenticode signature is
+            # cryptographically valid or trusted (Render/Linux cannot use
+            # Windows WinVerifyTrust here).
             meta["authenticode_present"] = signed
+            meta["certificate_table_present"] = signed
+            meta["authenticode_trust"] = "not-validated" if signed else "absent"
             if not signed:
-                ev.add(2, "No embedded Authenticode signature", "PE has no certificate table", "structure")
+                ev.add(2, "No PE certificate table", "PE has no embedded WIN_CERTIFICATE table", "structure")
 
             tls_rva, tls_size = directory(9)
             meta["tls_present"] = bool(tls_rva and tls_size)
@@ -806,6 +816,61 @@ def _find_pyi_cookie(path: str) -> tuple[int, bytes] | None:
     if idx < 0:
         return None
     return size - tail_size + idx, tail[idx:]
+
+
+def _is_standard_pyinstaller_runtime_entry(name: str) -> bool:
+    """Return True for common CPython/PyInstaller runtime binaries.
+
+    Generic Windows API names inside these DLL/PYD files are expected and must
+    not be treated as if the application itself requested process injection or
+    anti-debugging.  Payload-specific strings are still found elsewhere in the
+    bundle and by the advanced Python-category scanner.
+    """
+    base = name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if not base:
+        return False
+    if base.startswith(("api-ms-win-", "ext-ms-win-", "python3")):
+        return True
+    if base.startswith((
+        "_bz2.", "_ctypes.", "_decimal.", "_hashlib.", "_lzma.",
+        "_socket.", "_sqlite3.", "_ssl.", "_uuid.", "_wmi.",
+        "unicodedata.", "select.", "libffi-", "libssl-", "libcrypto-",
+    )):
+        return True
+    return base in {
+        "ucrtbase.dll", "vcruntime140.dll", "vcruntime140_1.dll",
+        "msvcp140.dll", "sqlite3.dll",
+    }
+
+
+def _scan_pyinstaller_payload_buffer(data: bytes, ev: _Evidence, *, context: str) -> None:
+    """Scan a PyInstaller entry while suppressing runtime-library noise.
+
+    Standard runtime binaries are not ignored completely; high-value data theft,
+    persistence, exfiltration, ransomware and downloader markers are retained.
+    Generic API names from CPython/API-set DLLs are suppressed because they
+    otherwise create artificial injection/evasion chains.
+    """
+    lname = context.split("PyInstaller:", 1)[-1]
+    if not _is_standard_pyinstaller_runtime_entry(lname):
+        _scan_indicator_buffer(data, ev, context=context)
+        return
+
+    low = data.lower()
+    high_signal = {
+        b"cryptunprotectdata", b"login data", b"local state", b"cookies.sqlite",
+        b"logins.json", b"key4.db", b"discord\\local storage\\leveldb",
+        b"telegram desktop\\tdata", b"currentversion\\run", b"schtasks",
+        b"discord.com/api/webhooks", b"api.telegram.org/bot", b"stratum+tcp://",
+        b"xmrig", b"vssadmin delete shadows", b"wmic shadowcopy delete",
+        b"set-mppreference -disablerealtimemonitoring", b"downloadstring",
+        b"invoke-expression", b"-encodedcommand",
+    }
+    for marker in high_signal:
+        if marker in low and marker in PATTERN_MAP:
+            pts, name, category = PATTERN_MAP[marker]
+            ev.pattern_hits.add(marker)
+            ev.add(pts, name, f"{marker.decode('ascii', 'ignore')} ({context}; runtime-filtered)", category)
 
 
 def _analyze_pyinstaller(path: str, ev: _Evidence, raw_markers: Iterable[str]) -> dict:
@@ -910,7 +975,7 @@ def _analyze_pyinstaller(path: str, ev: _Evidence, raw_markers: Iterable[str]) -
                         if len(blob) > MAX_PYI_ENTRY_BYTES:
                             blob = blob[:MAX_PYI_ENTRY_BYTES]
                         total_decompressed += len(blob)
-                        _scan_indicator_buffer(blob, ev, context=f"PyInstaller:{name or type_code}")
+                        _scan_pyinstaller_payload_buffer(blob, ev, context=f"PyInstaller:{name or type_code}")
                     except Exception:
                         pass
 
@@ -992,6 +1057,10 @@ def _static_verdict(ev: _Evidence) -> tuple[str, str, list[str]]:
 
     if "multi_stage_loader_cluster" in strong and ev.score >= 75 and len(cats & {"network", "filesystem", "execution", "injection", "credential_access"}) >= 1:
         reasons.append("multi-stage loader/dropper structure with corroborating operational behavior")
+        return "malicious", "high", reasons
+
+    if "process_thread_hijack_cluster" in strong and ev.score >= 60 and len(cats & {"network", "filesystem", "discovery", "execution"}) >= 1:
+        reasons.append("thread-context/process manipulation chain with dynamic resolution and operational behavior")
         return "malicious", "high", reasons
 
     if len(strong) >= 2 and ev.score >= 70:
